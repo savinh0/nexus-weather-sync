@@ -1,0 +1,45 @@
+name: Weather Station CI
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'  # Roda a cada 5 minutos nativamente
+  repository_dispatch:
+    types: [update_weather] # Pode ser disparado pelo cron-job.org
+
+permissions:
+  contents: write # Necessário para o bot salvar o estado no repositório
+
+jobs:
+  diagnostics:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Run Diagnostics Node
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        GEMINI_KEY_1: ${{ secrets.GEMINI_KEY_1 }}
+        GEMINI_KEY_2: ${{ secrets.GEMINI_KEY_2 }}
+        DECRYPT_KEY: ${{ secrets.DECRYPT_KEY }}
+      run: python weather_analyzer.py
+
+    - name: Synchronize Sensor Cache
+      run: |
+        git config --global user.name "Weather Station Bot"
+        git config --global user.email "bot@weather.local"
+        git add sensor_cache.dat
+        git commit -m "chore: synchronize sensor cache [skip ci]" || echo "No changes to commit"
+        git push
