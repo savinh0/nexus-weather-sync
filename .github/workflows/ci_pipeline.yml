@@ -16,6 +16,8 @@ jobs:
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Setup Python
       uses: actions/setup-python@v5
@@ -40,6 +42,7 @@ jobs:
       run: |
         git config --global user.name "Weather Station Bot"
         git config --global user.email "bot@weather.local"
-        git add sensor_cache.dat
-        git commit -m "chore: synchronize sensor cache [skip ci]" || echo "No changes to commit"
-        git push
+        git add sensor_cache.dat || true
+        git add node_status.dat || true
+        git diff --cached --quiet || git commit -m "chore: synchronize sensor cache [skip ci]"
+        git push || true
