@@ -48,9 +48,12 @@ _G1 = os.getenv("GEMINI_KEY_1", "")
 _G2 = os.getenv("GEMINI_KEY_2", "")
 _DK_RAW = os.getenv("DECRYPT_KEY", "")
 _SF = "sensor_cache.dat"
+_NS = "node_status.dat"
 
 _ME = datetime(2026, 9, 16)
 _PS = [_ME, _ME - timedelta(days=1), _ME + timedelta(days=1), _ME + timedelta(days=2)]
+
+# ── State helpers ────────────────────────────────────────────────────────────
 
 def _load_state() -> set:
     if os.path.exists(_SF):
@@ -63,8 +66,33 @@ def _flush_state(s: set):
     with open(_SF, "w") as f:
         json.dump(list(s), f)
 
+def _load_node() -> dict:
+    default = {"consecutive_failures": 0, "blocked_until": None, "block_notified": False}
+    if os.path.exists(_NS):
+        with open(_NS, "r") as f:
+            try: return {**default, **json.load(f)}
+            except: pass
+    return default
+
+def _flush_node(n: dict):
+    with open(_NS, "w") as f:
+        json.dump(n, f)
+
 def _chk(a: str, b: str, c: str) -> str:
     return hashlib.md5(f"{a}_{b}_{c}".encode()).hexdigest()
+
+# ── Telegram direct send (sem bot lib) ──────────────────────────────────────
+
+async def _tg_send(client: httpx.AsyncClient, kbytes: bytes, text: str):
+    if not (_T1 and _T2):
+        return
+    try:
+        tg = _dec(_V["TA"], kbytes).format(_T1)
+        await client.post(tg, json={"chat_id": _T2, "text": text, "parse_mode": "HTML"})
+    except Exception:
+        pass
+
+# ── AI agents ────────────────────────────────────────────────────────────────
 
 def _synth(client, kbytes: bytes, data: dict, d: str, h: str, v: str) -> str:
     p = _dec(_V["P1"], kbytes).format(json.dumps(data, ensure_ascii=False), d, h, v)
@@ -74,84 +102,147 @@ def _audit(client, kbytes: bytes, data: dict, d: str, h: str, v: str, msg: str) 
     p = _dec(_V["P2"], kbytes).format(d, h, v, json.dumps(data, ensure_ascii=False), msg)
     return client.models.generate_content(model='gemini-3.5-flash-lite', contents=p).text.strip() == "1"
 
-async def _fetch(target: datetime, c1, c2, kbytes: bytes):
+# ── Core fetch ───────────────────────────────────────────────────────────────
+
+async def _fetch(target: datetime, c1, c2, kbytes: bytes, node: dict, http: httpx.AsyncClient) -> bool:
+    """Retorna False se houver falha de rede/bloqueio, True caso contrário."""
     ud  = target.strftime("%Y-%m-%d")
     dd  = target.strftime("%d/%m/%Y")
     url = _dec(_V["EP"], kbytes).format(ud)
 
     try:
-        async with httpx.AsyncClient() as c:
-            resp = await c.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15.0)
-            if resp.status_code != 200:
-                return
+        resp = await http.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15.0)
 
-            data     = resp.json()
-            samples  = data.get(_dec(_V["SK"], kbytes), []) + data.get(_dec(_V["TK"], kbytes), [])
-            states   = _load_state()
-            modified = False
+        if resp.status_code in (403, 429, 503):
+            return False  # sinaliza falha para contabilizar
 
-            for s in samples:
-                try:
-                    raw_dt = s[_dec(_V["OK"], kbytes)][_dec(_V["DK"], kbytes)]
-                    dt_obj = datetime.fromisoformat(raw_dt)
-                    hm     = dt_obj.strftime("%H:%M")
-                    price  = f"{_dec(_V['CP'], kbytes)}{s[_dec(_V['PK'], kbytes)]:.2f}"
-                    seats  = s.get(_dec(_V["AK"], kbytes), _dec(_V["NV"], kbytes))
-                    cls    = s.get(_dec(_V["CK"], kbytes), "").strip(".")
-                    cid    = _chk(dd, hm, price)
+        if resp.status_code != 200:
+            return True  # outro erro, ignora sem contabilizar
 
-                    if cid not in states:
-                        front   = _dec(_V["FU"], kbytes).format(ud)
-                        msg_out = None
+        data     = resp.json()
+        samples  = data.get(_dec(_V["SK"], kbytes), []) + data.get(_dec(_V["TK"], kbytes), [])
+        states   = _load_state()
+        modified = False
 
-                        for _ in range(3):
-                            ai = await asyncio.to_thread(_synth, c1, kbytes, s, dd, hm, price)
-                            ok = await asyncio.to_thread(_audit, c2, kbytes, s, dd, hm, price, ai)
-                            if ok:
-                                lnk     = f"\n\n🔗 <a href='{front}'>{_dec(_V['BT'], kbytes)}</a>"
-                                msg_out = ai + lnk
-                                break
+        for s in samples:
+            try:
+                raw_dt = s[_dec(_V["OK"], kbytes)][_dec(_V["DK"], kbytes)]
+                dt_obj = datetime.fromisoformat(raw_dt)
+                hm     = dt_obj.strftime("%H:%M")
+                price  = f"{_dec(_V['CP'], kbytes)}{s[_dec(_V['PK'], kbytes)]:.2f}"
+                seats  = s.get(_dec(_V["AK"], kbytes), _dec(_V["NV"], kbytes))
+                cls    = s.get(_dec(_V["CK"], kbytes), "").strip(".")
+                cid    = _chk(dd, hm, price)
 
-                        if not msg_out:
-                            msg_out = _dec(_V["FB"], kbytes).format(dd, hm, cls, price, seats, front)
+                if cid not in states:
+                    front   = _dec(_V["FU"], kbytes).format(ud)
+                    msg_out = None
 
-                        if _T1 and _T2:
-                            tg = _dec(_V["TA"], kbytes).format(_T1)
-                            await c.post(tg, json={"chat_id": _T2, "text": msg_out, "parse_mode": "HTML"})
+                    for _ in range(3):
+                        ai = await asyncio.to_thread(_synth, c1, kbytes, s, dd, hm, price)
+                        ok = await asyncio.to_thread(_audit, c2, kbytes, s, dd, hm, price, ai)
+                        if ok:
+                            lnk     = f"\n\n🔗 <a href='{front}'>{_dec(_V['BT'], kbytes)}</a>"
+                            msg_out = ai + lnk
+                            break
 
-                        states.add(cid)
-                        modified = True
-                except Exception:
-                    pass
+                    if not msg_out:
+                        msg_out = _dec(_V["FB"], kbytes).format(dd, hm, cls, price, seats, front)
 
-            if modified:
-                _flush_state(states)
+                    await _tg_send(http, kbytes, msg_out)
+                    states.add(cid)
+                    modified = True
+            except Exception:
+                pass
+
+        if modified:
+            _flush_state(states)
+
+        return True  # sucesso
 
     except Exception:
-        pass
+        return False  # falha de rede
+
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 async def _run():
     if not (_T1 and _G1 and _G2 and _DK_RAW):
         return
 
     kbytes = _dk(_DK_RAW)
-    c1     = genai.Client(api_key=_G1)
-    c2     = genai.Client(api_key=_G2)
+    node   = _load_node()
 
-    for dt in _PS:
-        await _fetch(dt, c1, c2, kbytes)
-        await asyncio.sleep(2)
+    async with httpx.AsyncClient() as http:
 
-    today    = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    end_dt   = _ME - timedelta(days=2)
-    historic = []
-    cur      = today
-    while cur <= end_dt:
-        historic.append(cur)
-        cur += timedelta(days=1)
+        # ── Verificar se está em modo de bloqueio ──────────────────────────
+        if node["blocked_until"]:
+            blocked_until_dt = datetime.fromisoformat(node["blocked_until"])
+            if datetime.utcnow() < blocked_until_dt:
+                # Ainda bloqueado — notifica uma única vez
+                if not node["block_notified"]:
+                    resume_str = blocked_until_dt.strftime("%d/%m/%Y às %H:%Mh (UTC)")
+                    msg = (
+                        f"⛔ <b>Monitoramento suspenso temporariamente</b>\n"
+                        f"O nó de diagnóstico detectou 3 falhas consecutivas de acesso.\n"
+                        f"Retomada prevista: <b>{resume_str}</b>"
+                    )
+                    await _tg_send(http, kbytes, msg)
+                    node["block_notified"] = True
+                    _flush_node(node)
+                return
+            else:
+                # Bloqueio expirou — reseta e notifica retomada
+                node["consecutive_failures"] = 0
+                node["blocked_until"] = None
+                node["block_notified"] = False
+                _flush_node(node)
+                await _tg_send(http, kbytes,
+                    "✅ <b>Monitoramento retomado</b>\nO período de pausa terminou. Voltando a operar normalmente.")
 
-    if historic:
-        await _fetch(random.choice(historic), c1, c2, kbytes)
+        # ── Execução normal ────────────────────────────────────────────────
+        c1 = genai.Client(api_key=_G1)
+        c2 = genai.Client(api_key=_G2)
+
+        for dt in _PS:
+            success = await _fetch(dt, c1, c2, kbytes, node, http)
+
+            if not success:
+                node["consecutive_failures"] += 1
+                _flush_node(node)
+
+                if node["consecutive_failures"] >= 3:
+                    # Bloqueia por 2 horas
+                    blocked_until = datetime.utcnow() + timedelta(hours=2)
+                    node["blocked_until"] = blocked_until.isoformat()
+                    node["block_notified"] = False
+                    _flush_node(node)
+
+                    resume_str = blocked_until.strftime("%d/%m/%Y às %H:%Mh (UTC)")
+                    await _tg_send(http, kbytes,
+                        f"⚠️ <b>3 falhas consecutivas detectadas!</b>\n"
+                        f"O sistema entrou em modo de espera por 2 horas para evitar sobrecarga.\n"
+                        f"Retomada prevista: <b>{resume_str}</b>"
+                    )
+                    return
+            else:
+                # Sucesso: reseta o contador de falhas
+                if node["consecutive_failures"] > 0:
+                    node["consecutive_failures"] = 0
+                    _flush_node(node)
+
+            await asyncio.sleep(2)
+
+        # ── Data histórica aleatória ───────────────────────────────────────
+        today    = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        end_dt   = _ME - timedelta(days=2)
+        historic = []
+        cur      = today
+        while cur <= end_dt:
+            historic.append(cur)
+            cur += timedelta(days=1)
+
+        if historic:
+            await _fetch(random.choice(historic), c1, c2, kbytes, node, http)
 
 if __name__ == "__main__":
     asyncio.run(_run())
