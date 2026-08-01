@@ -67,7 +67,7 @@ def _flush_state(s: set):
         json.dump(list(s), f)
 
 def _load_node() -> dict:
-    default = {"consecutive_failures": 0, "blocked_until": None, "block_notified": False}
+    default = {"consecutive_failures": 0, "blocked_until": None, "block_notified": False, "historic_idx": 0}
     if os.path.exists(_NS):
         with open(_NS, "r") as f:
             try: return {**default, **json.load(f)}
@@ -232,7 +232,7 @@ async def _run():
 
             await asyncio.sleep(2)
 
-        # ── Data histórica aleatória ───────────────────────────────────────
+        # ── Data histórica em fila rotativa ──────────────────────────────────────
         today    = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         end_dt   = _ME - timedelta(days=2)
         historic = []
@@ -242,7 +242,10 @@ async def _run():
             cur += timedelta(days=1)
 
         if historic:
-            await _fetch(random.choice(historic), c1, c2, kbytes, node, http)
+            idx = node.get("historic_idx", 0) % len(historic)
+            await _fetch(historic[idx], c1, c2, kbytes, node, http)
+            node["historic_idx"] = (idx + 1) % len(historic)
+            _flush_node(node)
 
 if __name__ == "__main__":
     asyncio.run(_run())
