@@ -9,6 +9,14 @@ import httpx
 from google import genai
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+# --- Agentes de User-Agent rotativos (simula browsers diferentes) ---
+_UA_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+]
+
 # --- Runtime decryption core ---
 _SALT = b"wx_station_v1_salt_2026"
 
@@ -111,7 +119,7 @@ async def _fetch(target: datetime, c1, c2, kbytes: bytes, node: dict, http: http
     url = _dec(_V["EP"], kbytes).format(ud)
 
     try:
-        resp = await http.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15.0)
+        resp = await http.get(url, headers={"User-Agent": random.choice(_UA_POOL)}, timeout=15.0)
 
         if resp.status_code in (403, 429, 503):
             return False  # sinaliza falha para contabilizar
@@ -174,6 +182,10 @@ async def _run():
 
     async with httpx.AsyncClient() as http:
 
+        # ── Pausa inicial aleatória (simula um humano abrindo o site em horário variado) ──
+        initial_wait = random.randint(15, 90)
+        await asyncio.sleep(initial_wait)
+
         # ── Verificar se está em modo de bloqueio ──────────────────────────
         if node["blocked_until"]:
             blocked_until_dt = datetime.fromisoformat(node["blocked_until"])
@@ -230,7 +242,8 @@ async def _run():
                     node["consecutive_failures"] = 0
                     _flush_node(node)
 
-            await asyncio.sleep(2)
+            # Pausa humana entre datas: 8 a 25 segundos com variação
+            await asyncio.sleep(random.uniform(8, 25))
 
         # ── Data histórica em fila rotativa ──────────────────────────────────────
         today    = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
